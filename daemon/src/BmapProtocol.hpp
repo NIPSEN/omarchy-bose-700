@@ -154,7 +154,7 @@ inline constexpr uint8_t kRfcommChannel = 8;
 inline constexpr uint8_t kFirmwareFblock = 0,  kFirmwareFunc = 5;    // ASCII version string
 inline constexpr uint8_t kNameFblock = 1,      kNameFunc = 2;        // [flag] + UTF-8 name
 inline constexpr uint8_t kPromptsFblock = 1,   kPromptsFunc = 3;     // voice prompts
-inline constexpr uint8_t kCncFblock = 1,       kCncFunc = 5;         // 0..10 (0 = passthrough)
+inline constexpr uint8_t kCncFblock = 1,       kCncFunc = 5;         // 0..10 ANC strength (wire axis inverted, see parse_cnc)
 inline constexpr uint8_t kEqFblock = 1,        kEqFunc = 7;          // bass/mid/treble
 inline constexpr uint8_t kMultipointFblock = 1, kMultipointFunc = 10;
 inline constexpr uint8_t kSidetoneFblock = 1,  kSidetoneFunc = 11;
@@ -167,7 +167,7 @@ inline constexpr uint8_t kBatteryFblock = 2,   kBatteryFunc = 2;     // byte0 = 
 //   firmware  [0.5]  -> ASCII "1.8.2-11524+e0f7590"
 //   name      [1.2]  -> 00 "Panthère"      (first byte is a flag)
 //   prompts   [1.3]  -> 82 00 01 81 5e     (byte0: bit5 = enabled, bits0-4 = lang)
-//   cnc       [1.5]  -> 0b 00 01           (current = p[1], max = p[0] - 1)
+//   cnc       [1.5]  -> 0b 00 01           (raw current = p[1], max = p[0] - 1; raw 0 = max ANC)
 //   eq        [1.7]  -> 3 x [min, max, current_signed, band_id]
 //   multipoint[1.10] -> 03                 (bit1 = enabled)
 //   sidetone  [1.11] -> 01 02 0f           (p[1]: 0 off, 1 high, 2 medium, 3 low)
@@ -186,9 +186,17 @@ inline std::string parse_product_name(const std::vector<uint8_t>& p) {
     return p.size() > 1 ? std::string(p.begin() + 1, p.end()) : "";
 }
 
-// Returns {current, max}: payload[1] is the level, payload[0] - 1 the maximum.
+// Returns {current, max}: payload[1] is the raw wire level, payload[0] - 1 the
+// maximum. The raw axis is inverted relative to the Bose Music app: raw 0 is
+// maximum ANC and raw 10 is full passthrough. We publish ANC strength instead
+// (0 = full passthrough, 10 = max ANC), matching the app's slider.
 inline std::pair<uint8_t, uint8_t> parse_cnc(const std::vector<uint8_t>& p) {
-    if (p.size() >= 3) return {p[1], static_cast<uint8_t>(p[0] - 1)};
+    if (p.size() >= 3) {
+        uint8_t max = static_cast<uint8_t>(p[0] - 1);
+        uint8_t raw = p[1];
+        uint8_t strength = raw > max ? 0 : static_cast<uint8_t>(max - raw);
+        return {strength, max};
+    }
     return {0, 10};
 }
 
@@ -268,9 +276,10 @@ inline std::pair<bool, std::string> parse_voice_prompts(const std::vector<uint8_
 // this firmware — that is what makes writes work at all).
 // ---------------------------------------------------------------------------
 
-// CNC level 0..10 (0 = full passthrough / transparent, 10 = max ANC).
+// CNC ANC strength 0..10 (0 = full passthrough / transparent, 10 = max ANC).
+// The wire axis is inverted: raw 0 = max ANC, raw 10 = passthrough.
 inline std::vector<uint8_t> build_cnc(uint8_t level) {
-    return {level, 1};
+    return {static_cast<uint8_t>(level > 10 ? 0 : 10 - level), 1};
 }
 
 // One EQ band per SETGET: {signed value, band id}.

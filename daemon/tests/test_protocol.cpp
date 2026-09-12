@@ -83,17 +83,17 @@ void testPacketRoundTrip() {
     TEST_ASSERT(resp->op == bmap::Operator::Get, "operator round-trip");
     TEST_ASSERT(resp->payload.empty(), "empty payload round-trip");
 
-    // SETGET [1.5] {5, 1}
-    auto set = bmap::bmap_packet(1, 5, bmap::Operator::SetGet, bmap::build_cnc(5));
+    // SETGET [1.5] — strength 8 -> raw {2, 1} (wire axis inverted: raw 0 = max ANC)
+    auto set = bmap::bmap_packet(1, 5, bmap::Operator::SetGet, bmap::build_cnc(8));
     TEST_ASSERT_EQ(set.size(), size_t(6), "SETGET cnc is 6 bytes");
     TEST_ASSERT_EQ(set[2], 0x02, "SETGET operator");
     TEST_ASSERT_EQ(set[3], 0x02, "payload length 2");
-    TEST_ASSERT_EQ(set[4], 0x05, "cnc level");
+    TEST_ASSERT_EQ(set[4], 0x02, "cnc raw level (10 - strength)");
     TEST_ASSERT_EQ(set[5], 0x01, "cnc trailer");
 
     auto setResp = bmap::parse_response(set);
     TEST_ASSERT(setResp.has_value() && setResp->payload.size() == 2, "payload round-trip");
-    TEST_ASSERT_EQ(setResp->payload[0], 5, "payload byte 0");
+    TEST_ASSERT_EQ(setResp->payload[0], 2, "payload byte 0 (raw = 10 - strength)");
 
     // STATUS [2.2] {0x58} battery reply
     auto status = bmap::bmap_packet(2, 2, bmap::Operator::Status, {0x58});
@@ -171,10 +171,12 @@ void testFieldParsers() {
     TEST_ASSERT(bmap::parse_product_name(nameBytes) == "Panthère", "name skips flag byte");
     TEST_ASSERT(bmap::parse_product_name(V({0x00})).empty(), "name with only flag is empty");
 
-    // [1.5] cnc: 0b 00 01 -> current 0, max 10
+    // [1.5] cnc: 0b 00 01 -> raw current 0 (max ANC), max 10 -> strength 10
     auto cnc = bmap::parse_cnc(V({0x0b, 0x00, 0x01}));
-    TEST_ASSERT_EQ(cnc.first, 0, "cnc current");
+    TEST_ASSERT_EQ(cnc.first, 10, "cnc strength (raw 0 = max ANC)");
     TEST_ASSERT_EQ(cnc.second, 10, "cnc max");
+    // raw 10 = full passthrough -> strength 0
+    TEST_ASSERT_EQ(bmap::parse_cnc(V({0x0b, 0x0a, 0x01})).first, 0, "cnc raw 10 = passthrough");
 
     // [1.7] eq: three [min, max, current, band_id] groups, range -10..+10
     auto eq = bmap::parse_eq(V({
@@ -223,7 +225,9 @@ void testBuilders() {
     TEST_CASE("Builders");
 
     auto cnc = bmap::build_cnc(5);
-    TEST_ASSERT(cnc == V({5, 1}), "cnc payload {level, 1}");
+    TEST_ASSERT(cnc == V({5, 1}), "cnc payload {10 - level, 1} (midpoint is symmetric)");
+    TEST_ASSERT(bmap::build_cnc(10) == V({0, 1}), "cnc max ANC -> raw 0");
+    TEST_ASSERT(bmap::build_cnc(0) == V({10, 1}), "cnc passthrough -> raw 10");
 
     auto eqNeg = bmap::build_eq_band(-3, 1);
     TEST_ASSERT(eqNeg == V({0xfd, 0x01}), "eq payload {signed value, band id}");

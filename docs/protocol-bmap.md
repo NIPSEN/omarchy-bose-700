@@ -19,7 +19,7 @@ engineering in [aaronsb/bosectl](https://github.com/aaronsb/bosectl).
 | Firmware version | `[0.5]` | GET; string such as `1.8.2-11524+e0f7590` |
 | Device name | `[1.2]` | GET; the user-chosen Bluetooth name |
 | Voice prompts | `[1.3]` | GET/SET; on/off plus the prompt language |
-| Noise cancelling (CNC) | `[1.5]` | level 0–10 (0 = full transparency, 10 = max ANC); a direct SETGET returns the new level |
+| Noise cancelling (CNC) | `[1.5]` | GET/SETGET; wire payload `{raw, 1}` with the axis **inverted** — raw 0 = max ANC, raw 10 = full passthrough; the daemon exposes ANC strength (0 = transparency, 10 = max ANC), matching the Bose Music app |
 | Equalizer | `[1.7]` | one 4-byte group per band: `[min, max, current, band]`; bass/mid/treble, −10…+10 |
 | Button configuration | `[1.9]` | GET |
 | Multipoint | `[1.10]` | GET/SET; on/off |
