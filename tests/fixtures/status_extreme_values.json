@@ -1,0 +1,11 @@
+{
+  "schema": 1,
+  "connected": true,
+  "device": { "name": "Bose NC 700" },
+  "battery": { "level": 250 },
+  "cnc": { "level": 99, "max": 10 },
+  "eq": { "bass": -99, "mid": 99, "treble": "loud", "min": -10, "max": 10 },
+  "sidetone": "deafening",
+  "voice_prompts": { "enabled": "yes", "language": 42 },
+  "multipoint": "yes"
+}

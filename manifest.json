@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.nipsen.omarchybose700",
+  "name": "Bose NC 700",
+  "version": "1.0.0",
+  "author": "nipsen",
+  "license": "MIT",
+  "description": "Bose Noise Cancelling Headphones 700 Manager",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Bose NC 700",
+    "description": "Bose Noise Cancelling Headphones 700 Manager",
+    "category": "Audio",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

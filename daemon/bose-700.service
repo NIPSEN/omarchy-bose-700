@@ -1,0 +1,13 @@
+[Unit]
+Description=Bose NC Headphones 700 Headless Bluetooth Daemon
+PartOf=graphical-session.target
+After=bluetooth.target graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/bose-700-daemon
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=graphical-session.target

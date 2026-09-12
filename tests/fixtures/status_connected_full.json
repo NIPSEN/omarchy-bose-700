@@ -1,0 +1,17 @@
+{
+  "schema": 1,
+  "connected": true,
+  "device": {
+    "name": "Panthère",
+    "model": "Bose NC Headphones 700",
+    "firmware": "1.8.2-11524+e0f7590",
+    "address": "4C:87:5D:A3:D1:4F"
+  },
+  "battery": { "level": 87 },
+  "cnc": { "level": 0, "max": 10 },
+  "eq": { "bass": 0, "mid": 2, "treble": -1, "min": -10, "max": 10 },
+  "sidetone": "medium",
+  "voice_prompts": { "enabled": false, "language": "French" },
+  "multipoint": true,
+  "updated_at": "2026-09-12T10:00:00Z"
+}
