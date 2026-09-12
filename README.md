@@ -58,7 +58,7 @@ The headset advertises as `Bose NC 700` (or `LE-Bose NC 700`).
 - 🗂️ **Two tabs** — *Sound* and *Device*, so the panel stays short.
 - ⌨️ **Keyboard navigation** — vim-style (`h`/`j`/`k`/`l`, `Enter`, `Esc`) in the panel.
 - 💻 **CLI (`bose-700-ctl`)** — everything the panel does, scriptable.
-- ⚡ **No polling** — native BlueZ RFCOMM plus a file-watched state file.
+- ⚡ **No polling** — native BlueZ RFCOMM, and the daemon pushes each state change to the panel over its socket.
 
 Right-clicking the bar widget cycles noise cancelling: max ANC → transparency →
 halfway → max ANC, like the headset's own noise-control button.
@@ -75,12 +75,11 @@ halfway → max ANC, like the headset's own noise-control button.
 │   └───────▲───────┘ └──────▲──────┘ └──────▲───────┘   │
 │           │                │               │           │
 │           └────────────────┼───────────────┘           │
-│                            │ watches (FileView)        │
-│                 ~/.local/state/bose-700/               │
-│                        status.json                     │
-│                            ▲                           │
+│                            │ one UNIX socket:          │
+│                            │ commands out,             │
+│                            │ state pushed back         │
 └────────────────────────────┼───────────────────────────┘
-                             │ writes (atomic, 0600)
+                             │
 ┌────────────────────────────┼───────────────────────────┐
 │  Headless Daemon           │      Companion CLI        │
 │  (bose-700-daemon)         │      (bose-700-ctl)       │
@@ -88,6 +87,9 @@ halfway → max ANC, like the headset's own noise-control button.
 │   UNIX Domain Socket ◄─────┴────────────┘              │
 │   (/run/user/$UID/bose-700.sock)                       │
 │                 │                                      │
+│                 │  also writes ~/.local/state/         │
+│                 │  bose-700/status.json (0600) for     │
+│                 │  scripts that want to read it        │
 │                 ▼                                      │
 │   Bluetooth RFCOMM  (BMAP protocol, channel 8)         │
 │                 ▼                                      │
@@ -95,10 +97,31 @@ halfway → max ANC, like the headset's own noise-control button.
 └────────────────────────────────────────────────────────┘
 ```
 
+The widget lives inside the long-lived shell process, so it keeps that side as
+narrow as it can: it starts no processes, resolves nothing through `PATH` and
+opens no files. It connects to the daemon's socket in this login session's
+runtime directory (`/run/user/<uid>`), refusing any other path, sends
+`subscribe`, and is then pushed every state change.
+
+The socket itself belongs to your systemd user manager, not to the daemon:
+`bose-700.socket` creates it at login and holds it until logout, and the daemon
+inherits the listening descriptor instead of binding the path. The name is
+therefore never unbound while you are logged in, including while the daemon
+restarts, so nothing can take it and answer in the daemon's place — and a
+connection that arrives while the daemon is stopped starts it.
+
+Whatever is on the other end is still treated as untrusted. The parser hands
+the plugin raw chunks and each one is counted against a 64 KiB budget before it
+is buffered or searched for a newline, so a peer that never sends one cannot
+grow the shell's memory. At most 32 commands may be in flight, each is length
+checked, and a daemon that does not answer within five seconds is dropped and
+retried with a backoff.
+
 - **Plugin** (`Panel.qml`, `Service.qml`, `Model.js`, `BoseIcon.qml`) — Quickshell/QML, Omarchy manifest schema 1.
 - **`daemon/`** — C++20 daemon owning the RFCOMM link and the UNIX socket.
 - **`cli/`** — `bose-700-ctl`, a thin client for the same socket.
 - **`installer/`** — `bose-700-deploy`, the helper `setup` uses to place and remove files without following symlinks (built, never installed).
+- **`daemon/bose-700.socket`** — the systemd user socket that owns the control socket for the session; `daemon/bose-700.service` pulls it in.
 
 ---
 
@@ -121,8 +144,9 @@ cd omarchy-bose-700
 
 `./setup` verifies build dependencies, warns about missing Bluetooth
 prerequisites, builds with CMake + Ninja, installs `bose-700-daemon` and
-`bose-700-ctl` to `~/.local/bin/`, registers the `bose-700.service` user unit,
-and deploys the plugin to `~/.config/omarchy/plugins/`.
+`bose-700-ctl` to `~/.local/bin/`, registers the `bose-700.socket` and
+`bose-700.service` user units, and deploys the plugin to
+`~/.config/omarchy/plugins/`.
 
 **How setup protects itself.** Setup re-runs itself with an empty environment
 and a fixed system `PATH` (`/usr/bin:/usr/sbin:/bin:/sbin`). It keeps only the
@@ -160,10 +184,10 @@ Pair the headset first if you have not already — see
 ./setup --uninstall
 ```
 
-This stops and removes `bose-700.service`, deletes the two binaries from
-`~/.local/bin/` and the state in `~/.local/state/bose-700/`, and runs
-`omarchy plugin remove`, which takes the widget off the bar and deletes the
-plugin directory. Your Bluetooth pairing is left alone. If you installed from
+This stops and removes `bose-700.service` and `bose-700.socket`, deletes the
+two binaries from `~/.local/bin/` and the state in `~/.local/state/bose-700/`,
+and runs `omarchy plugin remove`, which takes the widget off the bar and
+deletes the plugin directory. Your Bluetooth pairing is left alone. If you installed from
 the marketplace, run it as
 `~/.config/omarchy/plugins/io.github.nipsen.omarchybose700/setup --uninstall`.
 
@@ -196,9 +220,17 @@ unreachable.
 ## Service
 
 ```bash
-systemctl --user status bose-700.service
+systemctl --user status bose-700.socket bose-700.service
 journalctl --user -u bose-700.service -f
-systemctl --user restart bose-700.service
+systemctl --user restart bose-700.service   # the socket stays bound throughout
+```
+
+The daemon also answers `subscribe` on its socket: a client that sends it is
+handed the current status immediately and then every state change, one JSON
+object per line — the same object the daemon writes to `status.json`:
+
+```bash
+socat - UNIX-CONNECT:/run/user/$(id -u)/bose-700.sock <<< subscribe
 ```
 
 ---

@@ -122,12 +122,15 @@ IpcServer::IpcServer(IpcServer&& other) noexcept
       actualSocketPath_(std::move(other.actualSocketPath_)),
       listenFd_(other.listenFd_),
       running_(other.running_),
+      socketActivated_(other.socketActivated_),
       maxLineLength_(other.maxLineLength_),
+      maxOutBuffer_(other.maxOutBuffer_),
       customHandler_(std::move(other.customHandler_)),
       callbacks_(std::move(other.callbacks_)),
       clients_(std::move(other.clients_)) {
     other.listenFd_ = -1;
     other.running_ = false;
+    other.socketActivated_ = false;
 }
 
 IpcServer& IpcServer::operator=(IpcServer&& other) noexcept {
@@ -137,15 +140,62 @@ IpcServer& IpcServer::operator=(IpcServer&& other) noexcept {
         actualSocketPath_ = std::move(other.actualSocketPath_);
         listenFd_ = other.listenFd_;
         running_ = other.running_;
+        socketActivated_ = other.socketActivated_;
         maxLineLength_ = other.maxLineLength_;
+        maxOutBuffer_ = other.maxOutBuffer_;
         customHandler_ = std::move(other.customHandler_);
         callbacks_ = std::move(other.callbacks_);
         clients_ = std::move(other.clients_);
 
         other.listenFd_ = -1;
         other.running_ = false;
+        other.socketActivated_ = false;
     }
     return *this;
+}
+
+// Socket activation: systemd's user manager creates and holds the listening
+// socket for the whole session, so the name is bound from login to logout and
+// there is no window during a daemon restart in which another process could
+// bind it and answer in the daemon's place. The descriptor arrives as fd 3.
+int IpcServer::takeSystemdListenFd() {
+    const char* pidEnv = ::getenv("LISTEN_PID");
+    const char* fdsEnv = ::getenv("LISTEN_FDS");
+    // Consumed once: a descriptor must never be adopted twice.
+    ::unsetenv("LISTEN_PID");
+    ::unsetenv("LISTEN_FDS");
+    ::unsetenv("LISTEN_FDNAMES");
+
+    if (pidEnv == nullptr || fdsEnv == nullptr) {
+        return -1;
+    }
+    errno = 0;
+    const long pid = std::strtol(pidEnv, nullptr, 10);
+    const long count = std::strtol(fdsEnv, nullptr, 10);
+    if (errno != 0 || pid != static_cast<long>(::getpid()) || count < 1) {
+        return -1;
+    }
+
+    constexpr int kListenFdsStart = 3;
+    const int fd = kListenFdsStart;
+
+    // It must really be a listening AF_UNIX stream socket.
+    int value = 0;
+    socklen_t len = sizeof(value);
+    if (::getsockopt(fd, SOL_SOCKET, SO_ACCEPTCONN, &value, &len) != 0 || value != 1) {
+        return -1;
+    }
+    len = sizeof(value);
+    if (::getsockopt(fd, SOL_SOCKET, SO_DOMAIN, &value, &len) != 0 || value != AF_UNIX) {
+        return -1;
+    }
+
+    const int flags = ::fcntl(fd, F_GETFL, 0);
+    if (flags < 0 || ::fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+        return -1;
+    }
+    ::fcntl(fd, F_SETFD, FD_CLOEXEC);
+    return fd;
 }
 
 bool IpcServer::start() {
@@ -155,6 +205,24 @@ bool IpcServer::start() {
 
     if (actualSocketPath_.empty()) {
         actualSocketPath_ = resolveSocketPath(socketPathConfig_);
+    }
+
+    // Prefer the listener the service manager already holds.
+    if (socketPathConfig_.empty()) {
+        const int inherited = takeSystemdListenFd();
+        if (inherited >= 0) {
+            listenFd_ = inherited;
+            socketActivated_ = true;
+            running_ = true;
+
+            struct sockaddr_un bound{};
+            socklen_t boundLen = sizeof(bound);
+            if (::getsockname(listenFd_, reinterpret_cast<struct sockaddr*>(&bound), &boundLen) == 0 &&
+                bound.sun_family == AF_UNIX && bound.sun_path[0] != '\0') {
+                actualSocketPath_ = bound.sun_path;
+            }
+            return true;
+        }
     }
 
     // 1. Ensure parent directory exists with mode 0700
@@ -229,9 +297,13 @@ void IpcServer::stop() {
         listenFd_ = -1;
     }
 
-    if (!actualSocketPath_.empty()) {
+    // A socket the service manager owns must survive this process: removing it
+    // would unbind the name and leave a window in which another process could
+    // take it and answer in the daemon's place.
+    if (!actualSocketPath_.empty() && !socketActivated_) {
         ::unlink(actualSocketPath_.c_str());
     }
+    socketActivated_ = false;
 
     running_ = false;
 }
@@ -289,7 +361,23 @@ void IpcServer::handleClientRead(int clientFd) {
                 std::string line = session.inBuffer.substr(0, pos);
                 session.inBuffer.erase(0, pos + 1);
 
-                std::string response = handleCommandLine(line);
+                // `subscribe` needs the session, so it is handled here rather
+                // than in the session-independent command parser. The pushed
+                // state is the same JSON object the daemon writes to
+                // status.json (no "ok" wrapper), one object per line.
+                std::string response;
+                if (trim(line) == "subscribe") {
+                    session.subscribed = true;
+                    response = callbacks_.getStatusJson ? callbacks_.getStatusJson() : std::string("{}");
+                    if (response.empty() || response.back() != '\n') {
+                        response += "\n";
+                    }
+                } else if (trim(line) == "unsubscribe") {
+                    session.subscribed = false;
+                    response = okJson();
+                } else {
+                    response = handleCommandLine(line);
+                }
                 if (!queueResponse(session, response)) {
                     closeClient(clientFd);
                     return;
@@ -343,6 +431,41 @@ void IpcServer::handleClientWrite(int clientFd) {
 bool IpcServer::queueResponse(ClientSession& session, const std::string& response) {
     session.outBuffer.append(response);
     return flushClientOutBuffer(session);
+}
+
+void IpcServer::broadcastStatus(const std::string& statusJson) {
+    std::string line = statusJson;
+    if (line.empty() || line.back() != '\n') {
+        line += "\n";
+    }
+
+    std::vector<int> stalled;
+    for (auto& [fd, session] : clients_) {
+        if (!session.subscribed) {
+            continue;
+        }
+        // A reader that never drains would otherwise queue without bound.
+        if (session.outBuffer.size() + line.size() > maxOutBuffer_) {
+            stalled.push_back(fd);
+            continue;
+        }
+        if (!queueResponse(session, line)) {
+            stalled.push_back(fd);
+        }
+    }
+    for (int fd : stalled) {
+        closeClient(fd);
+    }
+}
+
+size_t IpcServer::getSubscriberCount() const noexcept {
+    size_t count = 0;
+    for (const auto& [fd, session] : clients_) {
+        if (session.subscribed) {
+            ++count;
+        }
+    }
+    return count;
 }
 
 void IpcServer::closeClient(int clientFd) {
@@ -430,6 +553,20 @@ void IpcServer::handlePollEvents(std::span<const struct pollfd> pfds) {
     for (int fd : clientsToClose) {
         closeClient(fd);
     }
+}
+
+int IpcServer::pollOnce(int timeoutMs) {
+    std::vector<pollfd> pfds;
+    appendPollFds(pfds);
+    if (pfds.empty()) {
+        return 0;
+    }
+
+    int ret = ::poll(pfds.data(), static_cast<nfds_t>(pfds.size()), timeoutMs);
+    if (ret > 0) {
+        handlePollEvents(pfds);
+    }
+    return ret;
 }
 
 // ---------------------------------------------------------------------------

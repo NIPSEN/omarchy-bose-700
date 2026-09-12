@@ -395,8 +395,13 @@ int main(int argc, char* argv[]) {
     btManager->start();
 
     // 5. Initialize UNIX Domain Socket IPC Server
+    //
+    // With no explicit --runtime-dir the server resolves its own path, which
+    // also lets it adopt the listening socket systemd holds for the session
+    // (bose-700.socket) rather than binding the path itself. An explicit
+    // override always binds, so tests and manual runs stay predictable.
     std::string socketPath = runtimeDir + "/bose-700.sock";
-    IpcServer ipcServer(socketPath);
+    IpcServer ipcServer(opts.runtimeDir.empty() ? std::string() : socketPath);
 
     // Shared guard for write commands: an idle daemon is not connected.
     auto requireConnected = [&](std::string& err) -> bool {
@@ -587,6 +592,7 @@ int main(int argc, char* argv[]) {
     // 7. Unified Event Loop
     bool running = true;
     auto lastStatusPoll = std::chrono::steady_clock::now();
+    std::string lastPublishedStatus;
 
     while (running) {
         std::vector<struct pollfd> pfds;
@@ -668,6 +674,17 @@ int main(int argc, char* argv[]) {
             refreshField(g::kBatteryFblock, g::kBatteryFunc, "battery");
             if (connected()) {
                 refreshField(g::kCncFblock, g::kCncFunc, "cnc");
+            }
+        }
+
+        // Push the state to subscribed clients whenever it changes, so the bar
+        // widget never has to read the state file. The comparison runs at most
+        // once per 100 ms poll cycle and only sends when something differs.
+        if (ipcServer.getSubscriberCount() > 0) {
+            std::string statusJson = stateEngine.getStatusJson();
+            if (statusJson != lastPublishedStatus) {
+                lastPublishedStatus = statusJson;
+                ipcServer.broadcastStatus(statusJson);
             }
         }
     }

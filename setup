@@ -127,8 +127,10 @@ Steps performed:
   2. Configure and build daemon, CLI and installer helper with CMake and Ninja
      in build-setup/.
   3. Install bose-700-daemon and bose-700-ctl into ~/.local/bin (mode 0755).
-  4. Install daemon/bose-700.service into ~/.config/systemd/user/, then enable
-     and (re)start it.
+  4. Install daemon/bose-700.socket and daemon/bose-700.service into
+     ~/.config/systemd/user/, then enable and (re)start them. The socket unit
+     holds the control socket for the whole session, so the daemon inherits it
+     instead of binding the path itself.
   5. Deploy the plugin to ~/.config/omarchy/plugins/io.github.nipsen.omarchybose700,
      validate it, enable it next to the volume control, and restart the shell.
      If this checkout already is that directory (installed with
@@ -284,15 +286,20 @@ install_binaries() {
 }
 
 install_systemd_service() {
-  info "Installing systemd user service..."
-  "$DEPLOY" put .config/systemd/user 0644 "$ROOT_DIR/daemon/bose-700.service"
+  info "Installing systemd user socket and service..."
+  "$DEPLOY" put .config/systemd/user 0644 \
+    "$ROOT_DIR/daemon/bose-700.socket" \
+    "$ROOT_DIR/daemon/bose-700.service"
 
   "$SYSTEMCTL" --user daemon-reload 2>/dev/null || true
+  # The socket unit owns the listening socket for the whole session, so it goes
+  # up first and stays up while the daemon restarts.
+  "$SYSTEMCTL" --user enable --now bose-700.socket 2>/dev/null || true
   # enable --now starts it immediately; restart covers re-running setup over an
   # existing install, which would otherwise keep running the old binary.
   "$SYSTEMCTL" --user enable --now bose-700.service 2>/dev/null || true
   "$SYSTEMCTL" --user restart bose-700.service 2>/dev/null || true
-  success "bose-700.service installed, enabled and running."
+  success "bose-700.socket and bose-700.service installed, enabled and running."
 }
 
 deploy_plugin() {
@@ -379,9 +386,10 @@ uninstall() {
   ensure_deploy_helper
 
   "$SYSTEMCTL" --user disable --now bose-700.service 2>/dev/null || true
-  "$DEPLOY" remove .config/systemd/user bose-700.service
+  "$SYSTEMCTL" --user disable --now bose-700.socket 2>/dev/null || true
+  "$DEPLOY" remove .config/systemd/user bose-700.service bose-700.socket
   "$SYSTEMCTL" --user daemon-reload 2>/dev/null || true
-  success "bose-700.service stopped and removed."
+  success "bose-700.socket and bose-700.service stopped and removed."
 
   "$DEPLOY" remove .local/bin bose-700-daemon bose-700-ctl
   success "Binaries removed from $HOME/.local/bin/."

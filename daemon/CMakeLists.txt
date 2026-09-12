@@ -70,8 +70,13 @@ target_include_directories(bose-700-daemon PRIVATE
 install(TARGETS bose-700-daemon RUNTIME DESTINATION bin)
 
 # ---------------------------------------------------------------------------
-# Target 4: systemd User Service Unit
+# Target 4: systemd User Socket & Service Units
 # ---------------------------------------------------------------------------
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/bose-700.socket")
+    install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/bose-700.socket"
+        DESTINATION "lib/systemd/user"
+    )
+endif()
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/bose-700.service")
     install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/bose-700.service"
         DESTINATION "lib/systemd/user"

@@ -500,6 +500,171 @@ void testIpcServerSocket() {
 }
 
 // ---------------------------------------------------------------------------
+// 9. IpcServer subscribe/broadcast
+//
+// The bar widget subscribes and is then pushed every state change, so it never
+// reads the state file. A subscriber that stops reading must be dropped rather
+// than allowed to grow the daemon's memory.
+// ---------------------------------------------------------------------------
+void testIpcSubscribeAndBroadcast() {
+    TEST_CASE("IpcServer subscribe/broadcast");
+
+    char tmpl[] = "/tmp/test_bose700_sub_XXXXXX";
+    char* sandbox = ::mkdtemp(tmpl);
+    TEST_ASSERT(sandbox != nullptr, "mkdtemp for subscribe test must succeed");
+    const std::string sockPath = std::string(sandbox) + "/test.sock";
+
+    std::string statusJson = R"({"schema":1,"connected":true,"battery":{"level":42}})";
+
+    IpcServer server(sockPath);
+    IpcCallbacks cb;
+    cb.getStatusJson = [&statusJson]() { return statusJson; };
+    server.setCallbacks(cb);
+    TEST_ASSERT(server.start(), "IpcServer start must succeed");
+
+    auto connectClient = [&sockPath]() {
+        int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+        struct sockaddr_un addr{};
+        addr.sun_family = AF_UNIX;
+        std::strncpy(addr.sun_path, sockPath.c_str(), sizeof(addr.sun_path) - 1);
+        if (::connect(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) != 0) {
+            ::close(fd);
+            return -1;
+        }
+        return fd;
+    };
+    auto readLine = [](int fd, int tries = 20) {
+        std::string out;
+        char c = 0;
+        for (int i = 0; i < tries * 1000 && out.find('\n') == std::string::npos; ++i) {
+            ssize_t n = ::recv(fd, &c, 1, MSG_DONTWAIT);
+            if (n == 1) out.push_back(c);
+            else if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) break;
+            else if (n <= 0) break;
+        }
+        return out;
+    };
+
+    const int subscriber = connectClient();
+    const int bystander = connectClient();
+    TEST_ASSERT(subscriber >= 0 && bystander >= 0, "both clients must connect");
+    server.pollOnce(50);
+    TEST_ASSERT_EQ(server.getClientCount(), 2UL, "server must hold two clients");
+    TEST_ASSERT_EQ(server.getSubscriberCount(), 0UL, "nobody is subscribed yet");
+
+    ::send(subscriber, "subscribe\n", 10, 0);
+    server.pollOnce(50);
+    TEST_ASSERT_EQ(server.getSubscriberCount(), 1UL, "subscribe must register the session");
+    TEST_ASSERT_EQ(readLine(subscriber), statusJson + "\n", "subscribe answers with the current status");
+
+    statusJson = R"({"schema":1,"connected":true,"battery":{"level":41}})";
+    server.broadcastStatus(statusJson);
+    TEST_ASSERT_EQ(readLine(subscriber), statusJson + "\n", "a state change is pushed to the subscriber");
+    TEST_ASSERT_EQ(readLine(bystander), std::string(), "a client that never subscribed is not pushed to");
+
+    // A status is only sent whole: broadcastStatus appends the newline itself.
+    server.broadcastStatus(statusJson + "\n");
+    TEST_ASSERT_EQ(readLine(subscriber), statusJson + "\n", "an already terminated status is not doubled");
+
+    ::send(subscriber, "unsubscribe\n", 12, 0);
+    server.pollOnce(50);
+    TEST_ASSERT_EQ(readLine(subscriber), std::string("{\"ok\":true}\n"), "unsubscribe is acknowledged");
+    TEST_ASSERT_EQ(server.getSubscriberCount(), 0UL, "unsubscribe clears the session");
+    server.broadcastStatus(statusJson);
+    TEST_ASSERT_EQ(readLine(subscriber), std::string(), "nothing is pushed after unsubscribe");
+
+    // A subscriber that stops reading: the queue must be capped and the client
+    // dropped, not grown without bound.
+    ::send(subscriber, "subscribe\n", 10, 0);
+    server.pollOnce(50);
+    TEST_ASSERT_EQ(server.getSubscriberCount(), 1UL, "resubscribe works");
+    const std::string bulky = R"({"schema":1,"padding":")" + std::string(8192, 'x') + R"("})";
+    for (int i = 0; i < 200 && server.getSubscriberCount() > 0; ++i) {
+        server.broadcastStatus(bulky);
+    }
+    TEST_ASSERT_EQ(server.getSubscriberCount(), 0UL, "a subscriber that stops reading is dropped");
+    TEST_ASSERT_EQ(server.getClientCount(), 1UL, "only the stalled client is dropped");
+
+    ::close(subscriber);
+    ::close(bystander);
+    server.stop();
+    ::unlink(sockPath.c_str());
+    ::rmdir(sandbox);
+
+    TEST_PASS("IpcServer subscribe/broadcast");
+}
+
+// ---------------------------------------------------------------------------
+// 10. Socket activation: the service manager holds the listening socket for
+// the session, so the daemon must adopt the descriptor it is handed instead of
+// binding the path itself.
+// ---------------------------------------------------------------------------
+void testIpcSocketActivation() {
+    TEST_CASE("IpcServer socket activation");
+
+    char tmpl[] = "/tmp/test_bose700_act_XXXXXX";
+    char* sandbox = ::mkdtemp(tmpl);
+    TEST_ASSERT(sandbox != nullptr, "mkdtemp for activation test must succeed");
+    const std::string sockPath = std::string(sandbox) + "/activated.sock";
+
+    // Stand in for systemd: bind and listen here, then hand fd 3 over.
+    int bound = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    TEST_ASSERT(bound >= 0, "listener creation must succeed");
+    struct sockaddr_un addr{};
+    addr.sun_family = AF_UNIX;
+    std::strncpy(addr.sun_path, sockPath.c_str(), sizeof(addr.sun_path) - 1);
+    TEST_ASSERT_EQ(::bind(bound, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)), 0, "bind must succeed");
+    TEST_ASSERT_EQ(::listen(bound, 8), 0, "listen must succeed");
+
+    constexpr int kListenFdsStart = 3;
+    if (bound != kListenFdsStart) {
+        TEST_ASSERT(::dup2(bound, kListenFdsStart) == kListenFdsStart, "handover to fd 3 must succeed");
+        ::close(bound);
+    }
+    ::setenv("LISTEN_PID", std::to_string(::getpid()).c_str(), 1);
+    ::setenv("LISTEN_FDS", "1", 1);
+
+    {
+        IpcServer server;
+        TEST_ASSERT(server.start(), "start must succeed with an inherited socket");
+        TEST_ASSERT(server.isSocketActivated(), "the inherited descriptor must be adopted");
+        TEST_ASSERT_EQ(server.getSocketPath(), sockPath, "the adopted socket keeps its bound path");
+        TEST_ASSERT_EQ(server.getListenFd(), kListenFdsStart, "the passed descriptor is used as-is");
+        TEST_ASSERT(::getenv("LISTEN_FDS") == nullptr, "LISTEN_FDS is consumed, never inherited twice");
+
+        // A client reaches the adopted listener.
+        int clientFd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+        TEST_ASSERT_EQ(::connect(clientFd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)), 0,
+                       "connect to the adopted socket must succeed");
+        server.pollOnce(50);
+        TEST_ASSERT_EQ(server.getClientCount(), 1UL, "the adopted listener accepts clients");
+        ::close(clientFd);
+        server.stop();
+
+        // Stopping must leave the manager's socket bound: unlinking it would
+        // open exactly the window socket activation exists to close.
+        struct stat st{};
+        TEST_ASSERT_EQ(::stat(sockPath.c_str(), &st), 0, "an adopted socket is left in place on stop");
+    }
+
+    // Without the environment, the daemon binds for itself as before.
+    {
+        const std::string ownPath = std::string(sandbox) + "/own.sock";
+        IpcServer server(ownPath);
+        TEST_ASSERT(server.start(), "start must succeed without socket activation");
+        TEST_ASSERT(!server.isSocketActivated(), "a self-bound socket is not reported as activated");
+        server.stop();
+
+        struct stat st{};
+        TEST_ASSERT(::stat(ownPath.c_str(), &st) != 0, "a self-bound socket is cleaned up on stop");
+    }
+
+    ::unlink(sockPath.c_str());
+    ::rmdir(sandbox);
+    TEST_PASS("IpcServer socket activation");
+}
+
+// ---------------------------------------------------------------------------
 // Main Runner
 // ---------------------------------------------------------------------------
 int main() {
@@ -515,6 +680,8 @@ int main() {
     testStateEngine();
     testIpcServer();
     testIpcServerSocket();
+    testIpcSubscribeAndBroadcast();
+    testIpcSocketActivation();
 
     std::cout << "========================================\n";
     std::cout << "Summary: " << (gTotalTests - gFailedTests) << "/" << gTotalTests
