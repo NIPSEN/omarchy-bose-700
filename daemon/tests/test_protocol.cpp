@@ -292,6 +292,46 @@ void testMockTransportAndBluetoothManager() {
 }
 
 // ---------------------------------------------------------------------------
+// 5b. ACL gate & backoff schedule
+// ---------------------------------------------------------------------------
+void testAclGateAndBackoff() {
+    TEST_CASE("AclGateAndBackoff");
+
+    // Backoff: grows from 2 s, capped at 60 s, jitter within [base, base+20%]
+    BluetoothConfig cfg;
+    uint32_t b1 = computeBackoffMs(cfg, 1);
+    uint32_t b8 = computeBackoffMs(cfg, 8);
+    uint32_t b30 = computeBackoffMs(cfg, 30);
+    TEST_ASSERT(b1 >= 3000 && b1 <= 3600, "attempt 1 ~3s with jitter");
+    TEST_ASSERT(b8 > b1, "backoff grows");
+    TEST_ASSERT(b30 >= 60000 && b30 <= 72000, "backoff capped at 60s + jitter");
+
+    // Gate: headset paired but ACL link down -> no RFCOMM attempt, BlueZ asked
+    auto transport = std::make_unique<MockTransport>();
+    auto* transportPtr = transport.get();
+    auto discovery = std::make_unique<MockDeviceDiscovery>();
+    auto* discoveryPtr = discovery.get();
+    BluetoothDeviceInfo dev;
+    dev.macAddress = "4C:87:5D:A3:D1:4F";
+    dev.name = "Panthère";
+    dev.paired = true;
+    dev.connected = false;  // headset off
+    discovery->devices.push_back(dev);
+
+    BluetoothManager mgr({}, std::move(transport), std::move(discovery),
+                         std::make_unique<MockSdpResolver>());
+    mgr.start();
+    TEST_ASSERT(mgr.getState() == ConnectionState::RECONNECT_BACKOFF,
+                "waits for the ACL link instead of hammering RFCOMM");
+    TEST_ASSERT(!transportPtr->isConnected(), "no RFCOMM attempt while ACL down");
+    TEST_ASSERT(discoveryPtr->lastConnectRequest == "4C:87:5D:A3:D1:4F",
+                "BlueZ connect requested for the headset");
+    mgr.stop();
+
+    TEST_PASS("AclGateAndBackoff");
+}
+
+// ---------------------------------------------------------------------------
 // 6. StateEngine & status.json
 // ---------------------------------------------------------------------------
 void testStateEngine() {
@@ -677,6 +717,7 @@ int main() {
     testFieldParsers();
     testBuilders();
     testMockTransportAndBluetoothManager();
+    testAclGateAndBackoff();
     testStateEngine();
     testIpcServer();
     testIpcServerSocket();

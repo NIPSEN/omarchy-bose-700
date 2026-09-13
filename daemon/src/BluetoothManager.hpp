@@ -18,6 +18,7 @@
 #include <optional>
 #include <deque>
 #include <chrono>
+#include <cmath>
 
 namespace omarchy::bose {
 
@@ -51,13 +52,28 @@ struct BluetoothConfig {
     std::string preferredMac;          // If set, only connect to this MAC
     bool autoReconnect{true};
     uint32_t initialBackoffMs{2000};
-    uint32_t maxBackoffMs{10000};
+    uint32_t maxBackoffMs{60000};
     float backoffMultiplier{1.5f};
+    // While BlueZ reports the headset's ACL link down, we never attempt RFCOMM:
+    // we re-check the (purely local) BlueZ state on this cadence and ask BlueZ
+    // itself to connect at most every connectRequestIntervalMs.
+    uint32_t discoveryRetryMs{15000};
+    uint32_t connectRequestIntervalMs{60000};
     uint32_t sdpTimeoutMs{3000};
     uint32_t connectTimeoutMs{8000};
     uint8_t defaultChannel{DEFAULT_RFCOMM_CHANNEL}; // Fallback channel if SDP fails
     bool mockMode{false};
 };
+
+// Backoff for real link failures: initialBackoffMs * multiplier^n, capped at
+// maxBackoffMs, with a deterministic +/-20% jitter to decorrelate retries.
+inline uint32_t computeBackoffMs(const BluetoothConfig& c, uint32_t retryCount) {
+    float d = c.initialBackoffMs * std::pow(c.backoffMultiplier, std::min(retryCount, 12u));
+    uint32_t base = static_cast<uint32_t>(d);
+    if (base > c.maxBackoffMs) base = c.maxBackoffMs;
+    uint32_t jitter = base / 5 * (retryCount % 3) / 2;  // 0%, +10%, +20%
+    return base + jitter;
+}
 
 // ---------------------------------------------------------------------------
 // Abstract Interfaces
@@ -88,6 +104,9 @@ public:
     virtual ~IDeviceDiscovery() = default;
     virtual std::vector<BluetoothDeviceInfo> getAvailableDevices() = 0;
     virtual std::optional<BluetoothDeviceInfo> findBoseHeadphones(const std::string& preferredMac = "") = 0;
+    // Ask BlueZ to bring the ACL link up (standard connection path — this is
+    // also what wakes a paired but idle headset). Fire-and-forget.
+    virtual bool requestConnect(const std::string& macAddress) = 0;
 };
 
 // SDP Resolver abstraction (BlueZ sdp_lib or Mock)
@@ -137,6 +156,13 @@ public:
     }
 
     std::optional<BluetoothDeviceInfo> findBoseHeadphones(const std::string& preferredMac = "") override;
+
+    bool requestConnect(const std::string& macAddress) override {
+        lastConnectRequest = macAddress;
+        return true;
+    }
+
+    std::string lastConnectRequest;
 };
 
 class MockSdpResolver : public ISdpResolver {
@@ -208,6 +234,9 @@ private:
     void handleConnectedRead();
     void handleConnectedWrite();
     void scheduleReconnect(const std::string& reason);
+    // Headset paired but ACL link down: poll BlueZ state on a fixed cadence
+    // (local D-Bus query, no radio impact) and let BlueZ bring the link up.
+    void scheduleDiscoveryRetry(const std::string& reason);
     void attemptDiscovery();
     void attemptSdp();
     void attemptConnect();
@@ -231,6 +260,7 @@ private:
     uint32_t retryCount_{0};
     std::chrono::steady_clock::time_point lastStateChangeTime_;
     std::chrono::steady_clock::time_point nextReconnectTime_;
+    std::chrono::steady_clock::time_point lastConnectRequest_{};
 };
 
 } // namespace omarchy::bose

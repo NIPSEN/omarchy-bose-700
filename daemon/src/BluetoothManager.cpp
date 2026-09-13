@@ -296,6 +296,15 @@ private:
         auto end = info.find('\n', pos);
         return info.substr(pos, end == std::string::npos ? end : end - pos);
     }
+
+public:
+    // Standard BlueZ connection path — the clean way to bring the ACL link up
+    // (and to wake a paired but idle headset) without touching RFCOMM.
+    bool requestConnect(const std::string& macAddress) override {
+        if (!isMac(macAddress)) return false;
+        exec("timeout 10 bluetoothctl connect " + macAddress + " 2>/dev/null");
+        return true;
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -573,10 +582,21 @@ void BluetoothManager::attemptDiscovery() {
         return;
     }
 
-    // Note: unlike the XM3 daemon we deliberately do NOT skip the RFCOMM
-    // attempt when BlueZ reports "Connected: no" — a direct RFCOMM connect
-    // brings up the ACL link itself, which is how bosectl reaches a paired
-    // but idle headset that `bluetoothctl connect` cannot wake.
+    // Never open RFCOMM while BlueZ reports the ACL link down. Hammering
+    // connect() on a powered-off headset stresses the kernel Bluetooth stack
+    // (and froze this machine); the link state is known locally via D-Bus, so
+    // poll it cheaply and let BlueZ bring the link up instead.
+    if (!currentDevice_.connected) {
+        auto now = std::chrono::steady_clock::now();
+        auto sinceLast = std::chrono::duration_cast<std::chrono::milliseconds>(
+            now - lastConnectRequest_).count();
+        if (sinceLast >= static_cast<int64_t>(config_.connectRequestIntervalMs)) {
+            lastConnectRequest_ = now;
+            discovery_->requestConnect(currentDevice_.macAddress);
+        }
+        scheduleDiscoveryRetry("Headset not connected at ACL level");
+        return;
+    }
 
     attemptSdp();
 }
@@ -740,6 +760,21 @@ bool BluetoothManager::sendPacket(const std::vector<uint8_t>& packet) {
     return sendPacket(packet.data(), packet.size());
 }
 
+void BluetoothManager::scheduleDiscoveryRetry(const std::string& reason) {
+    lastError_ = reason;
+    if (transport_) {
+        transport_->disconnect();
+    }
+    sendQueue_.clear();
+    setState(ConnectionState::RECONNECT_BACKOFF);
+    if (callbacks_.onDisconnected) {
+        callbacks_.onDisconnected(reason);
+    }
+    // Fixed local-poll cadence; does not grow retryCount_ (no failing I/O here).
+    nextReconnectTime_ = std::chrono::steady_clock::now() +
+                         std::chrono::milliseconds(config_.discoveryRetryMs);
+}
+
 void BluetoothManager::scheduleReconnect(const std::string& reason) {
     lastError_ = reason;
     fprintf(stderr, "[BT] Reconnect scheduled: %s\n", reason.c_str());
@@ -760,9 +795,7 @@ void BluetoothManager::scheduleReconnect(const std::string& reason) {
     }
 
     retryCount_++;
-    auto delay = static_cast<uint32_t>(config_.initialBackoffMs *
-                 std::pow(config_.backoffMultiplier, std::min(retryCount_, 10u)));
-    currentBackoffMs_ = std::min(delay, config_.maxBackoffMs);
+    currentBackoffMs_ = computeBackoffMs(config_, retryCount_);
     nextReconnectTime_ = std::chrono::steady_clock::now() + std::chrono::milliseconds(currentBackoffMs_);
     fprintf(stderr, "[BT] Will retry in %u ms (attempt #%u)\n", currentBackoffMs_, retryCount_);
     fflush(stderr);
