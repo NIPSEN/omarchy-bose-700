@@ -8,6 +8,10 @@ This is a port of [kevincardwell/omarchy-sony-xm3](https://github.com/kevincardw
 to the XM3) to the Bose NC700 and its BMAP protocol. The architecture is the
 same; the protocol layer and the feature set are not.
 
+| Sound | Device |
+|---|---|
+| ![Sound tab — noise cancelling slider and equalizer](docs/screenshots/sound.png) | ![Device tab — sidetone, voice prompts, multipoint](docs/screenshots/device.png) |
+
 ---
 
 ## Requirements
