@@ -3,6 +3,7 @@ cmake_minimum_required(VERSION 3.20)
 # Package Resolution via PkgConfig
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(BLUEZ REQUIRED IMPORTED_TARGET bluez)
+pkg_check_modules(SDBUS REQUIRED IMPORTED_TARGET libsystemd)
 find_package(Threads REQUIRED)
 
 # ---------------------------------------------------------------------------
@@ -10,6 +11,7 @@ find_package(Threads REQUIRED)
 # ---------------------------------------------------------------------------
 set(PROTOCOL_LIB_SOURCES
     src/BluetoothManager.cpp
+    src/BluezWatcher.cpp
     src/BmapLink.cpp
     src/StateEngine.cpp
     src/IpcServer.cpp
@@ -26,6 +28,7 @@ target_include_directories(bose_700_lib PUBLIC
 
 target_link_libraries(bose_700_lib PUBLIC
     PkgConfig::BLUEZ
+    PkgConfig::SDBUS
     Threads::Threads
 )
 

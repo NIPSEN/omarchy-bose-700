@@ -6,6 +6,7 @@
 
 #include "BmapProtocol.hpp"
 #include "BluetoothManager.hpp"
+#include "BluezWatcher.hpp"
 #include "BmapLink.hpp"
 #include "StateEngine.hpp"
 #include "IpcServer.hpp"
@@ -329,6 +330,77 @@ void testAclGateAndBackoff() {
     mgr.stop();
 
     TEST_PASS("AclGateAndBackoff");
+}
+
+// ---------------------------------------------------------------------------
+// 5c. BlueZ watcher: path matching & event-driven link tracking
+// ---------------------------------------------------------------------------
+void testBluezWatcherEvents() {
+    TEST_CASE("BluezWatcherEvents");
+
+    // Pure path matcher (bus-free)
+    TEST_ASSERT(bluezDevicePathMatches("/org/bluez/hci0/dev_4C_87_5D_A3_D1_4F", "4C:87:5D:A3:D1:4F"),
+                "hci0 device path matches");
+    TEST_ASSERT(bluezDevicePathMatches("/org/bluez/hci1/dev_4C_87_5D_A3_D1_4F", "4C:87:5D:A3:D1:4F"),
+                "any adapter matches");
+    TEST_ASSERT(bluezDevicePathMatches("/org/bluez/hci0/dev_4C_87_5D_A3_D1_4F", "4c:87:5d:a3:d1:4f"),
+                "MAC match is case-insensitive");
+    TEST_ASSERT(!bluezDevicePathMatches("/org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF", "4C:87:5D:A3:D1:4F"),
+                "another MAC is rejected");
+    TEST_ASSERT(!bluezDevicePathMatches("/org/other/dev_4C_87_5D_A3_D1_4F", "4C:87:5D:A3:D1:4F"),
+                "non-BlueZ path is rejected");
+    TEST_ASSERT(!bluezDevicePathMatches("/org/bluez/hci0", "4C:87:5D:A3:D1:4F"),
+                "adapter path is rejected");
+    TEST_ASSERT(!bluezDevicePathMatches("/org/bluez/hci0/dev_4C_87_5D_A3_D1_4F", "bogus"),
+                "invalid MAC is rejected");
+
+    // An inactive watcher degrades gracefully for the poll loop
+    BluezWatcher watcher;
+    TEST_ASSERT(!watcher.isActive(), "watcher is inactive before start");
+    TEST_ASSERT_EQ(watcher.getPollFd(), -1, "no fd without a bus");
+    TEST_ASSERT_EQ(watcher.getPollEvents(), short(0), "no poll events without a bus");
+
+    // Event-driven manager: paired but ACL-down parks, Connected=true connects
+    // immediately, Connected=false drops the link.
+    auto transport = std::make_unique<MockTransport>();
+    auto* transportPtr = transport.get();
+    auto discovery = std::make_unique<MockDeviceDiscovery>();
+    auto* discoveryPtr = discovery.get();
+    BluetoothDeviceInfo dev;
+    dev.macAddress = "4C:87:5D:A3:D1:4F";
+    dev.name = "Panthère";
+    dev.paired = true;
+    dev.connected = false;  // headset off
+    discovery->devices.push_back(dev);
+
+    BluetoothManager mgr({}, std::move(transport), std::move(discovery),
+                         std::make_unique<MockSdpResolver>());
+    mgr.start();
+    TEST_ASSERT(mgr.getState() == ConnectionState::RECONNECT_BACKOFF, "parked while ACL down");
+    TEST_ASSERT(mgr.waitingForAclLink(), "parked state is observable");
+    TEST_ASSERT(!transportPtr->isConnected(), "no RFCOMM attempt while parked");
+
+    // The wake-up nudge is throttled: a connect request was just sent by
+    // start(), so an immediate nudge is a no-op.
+    discoveryPtr->lastConnectRequest.clear();
+    mgr.requestConnectWakeUp();
+    TEST_ASSERT(discoveryPtr->lastConnectRequest.empty(), "wake-up nudge is throttled");
+
+    // Connected=true event: immediate discovery->SDP->RFCOMM, no timer wait.
+    discoveryPtr->devices[0].connected = true; // BlueZ now sees the link up
+    mgr.onBluezConnectedChange(true);
+    TEST_ASSERT(mgr.getState() == ConnectionState::CONNECTED, "event-driven immediate connect");
+    TEST_ASSERT(transportPtr->isConnected(), "RFCOMM up right after the event");
+    TEST_ASSERT(!mgr.waitingForAclLink(), "no longer parked");
+
+    // Connected=false event: drop the link like a lost RFCOMM connection.
+    mgr.onBluezConnectedChange(false);
+    TEST_ASSERT(mgr.getState() == ConnectionState::RECONNECT_BACKOFF, "link dropped on ACL-down event");
+    TEST_ASSERT(!transportPtr->isConnected(), "transport torn down on ACL-down event");
+
+    mgr.stop();
+
+    TEST_PASS("BluezWatcherEvents");
 }
 
 // ---------------------------------------------------------------------------
@@ -718,6 +790,7 @@ int main() {
     testBuilders();
     testMockTransportAndBluetoothManager();
     testAclGateAndBackoff();
+    testBluezWatcherEvents();
     testStateEngine();
     testIpcServer();
     testIpcServerSocket();

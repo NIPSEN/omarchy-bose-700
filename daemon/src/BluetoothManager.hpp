@@ -55,8 +55,9 @@ struct BluetoothConfig {
     uint32_t maxBackoffMs{60000};
     float backoffMultiplier{1.5f};
     // While BlueZ reports the headset's ACL link down, we never attempt RFCOMM:
-    // we re-check the (purely local) BlueZ state on this cadence and ask BlueZ
-    // itself to connect at most every connectRequestIntervalMs.
+    // we wait for BlueZ to report Connected (event-driven via the sd-bus
+    // watcher, timer-based re-poll as fallback) and ask BlueZ itself to bring
+    // the link up at most every connectRequestIntervalMs.
     uint32_t discoveryRetryMs{15000};
     uint32_t connectRequestIntervalMs{60000};
     uint32_t sdpTimeoutMs{3000};
@@ -222,6 +223,25 @@ public:
     void handleSocketEvent(short revents);
     void tick();
 
+    // Called by the daemon's BlueZ sd-bus watcher when the target headset's
+    // org.bluez.Device1 Connected property changes. `true` wakes a manager
+    // that is parked waiting for the ACL link (it runs the
+    // discovery->SDP->RFCOMM path immediately); `false` drops the link like
+    // a lost RFCOMM connection.
+    void onBluezConnectedChange(bool connected);
+
+    // Re-issue the throttled `bluetoothctl connect` wake-up nudge while parked
+    // waiting for the ACL link. Driven by the poll-loop timer (no-op more
+    // often than connectRequestIntervalMs).
+    void requestConnectWakeUp();
+
+    // True while the manager holds a known paired device whose ACL link is
+    // down. With an event-driven BlueZ watcher active the daemon skips
+    // timer-based re-polling entirely and only asks BlueZ to connect on the
+    // connectRequestIntervalMs cadence (the wake-up nudge for a paired but
+    // idle headset).
+    [[nodiscard]] bool waitingForAclLink() const noexcept { return waitingForAclLink_; }
+
     // Inspection
     [[nodiscard]] ConnectionState getState() const noexcept { return state_; }
     [[nodiscard]] const BluetoothDeviceInfo& getCurrentDevice() const noexcept { return currentDevice_; }
@@ -234,8 +254,10 @@ private:
     void handleConnectedRead();
     void handleConnectedWrite();
     void scheduleReconnect(const std::string& reason);
-    // Headset paired but ACL link down: poll BlueZ state on a fixed cadence
-    // (local D-Bus query, no radio impact) and let BlueZ bring the link up.
+    // Headset paired but ACL link down: park until BlueZ reports Connected.
+    // With an event-driven watcher (main.cpp) the daemon only re-arms the
+    // requestConnect wake-up nudge; without one it re-polls the (purely
+    // local) BlueZ state on a fixed discoveryRetryMs cadence.
     void scheduleDiscoveryRetry(const std::string& reason);
     void attemptDiscovery();
     void attemptSdp();
@@ -258,6 +280,7 @@ private:
     // Timing & backoff
     uint32_t currentBackoffMs_{2000};
     uint32_t retryCount_{0};
+    bool waitingForAclLink_{false};
     std::chrono::steady_clock::time_point lastStateChangeTime_;
     std::chrono::steady_clock::time_point nextReconnectTime_;
     std::chrono::steady_clock::time_point lastConnectRequest_{};

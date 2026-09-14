@@ -22,6 +22,7 @@
 
 #include "BmapProtocol.hpp"
 #include "BluetoothManager.hpp"
+#include "BluezWatcher.hpp"
 #include "BmapLink.hpp"
 #include "StateEngine.hpp"
 #include "IpcServer.hpp"
@@ -347,10 +348,29 @@ int main(int argc, char* argv[]) {
         return false;
     };
 
+    // Event-driven ACL link tracking (replaces the periodic bluetoothctl
+    // state scrape while the headset is paired but not connected). Optional:
+    // without a working system bus we fall back to timer-based polling.
+    BluezWatcher bluezWatcher;
+    if (!opts.mockMode) {
+        if (bluezWatcher.start()) {
+            bluezWatcher.setTargetMac(opts.preferredMac); // empty until first discovery
+            bluezWatcher.setCallback([&](bool aclConnected) {
+                btManager->onBluezConnectedChange(aclConnected);
+            });
+        } else {
+            fprintf(stderr, "[BT] BlueZ D-Bus watcher unavailable (%s); "
+                            "falling back to %u ms polling\n",
+                    bluezWatcher.getLastError().c_str(), btConfig.discoveryRetryMs);
+            fflush(stderr);
+        }
+    }
+
     BluetoothCallbacks callbacks;
     callbacks.onConnected = [&]() {
         link.reset();
         const auto& dev = btManager->getCurrentDevice();
+        bluezWatcher.setTargetMac(dev.macAddress);
         const std::string name = dev.name.empty() ? DEFAULT_DEVICE_NAME : dev.name;
         stateEngine.setConnected(true);
         stateEngine.setDeviceInfo(name, "", dev.macAddress);
@@ -609,12 +629,29 @@ int main(int argc, char* argv[]) {
             pfds.push_back({btFd, btEvents, 0});
         }
 
-        // Entries 2+: IPC listen socket and connected client sockets
+        // Entry 2 (Optional): sd-bus fd of the BlueZ link-state watcher
+        int busIndex = -1;
+        int busFd = bluezWatcher.getPollFd();
+        short busEvents = bluezWatcher.getPollEvents();
+        if (busFd >= 0 && busEvents != 0) {
+            busIndex = static_cast<int>(pfds.size());
+            pfds.push_back({busFd, busEvents, 0});
+        }
+
+        // Entries 3+: IPC listen socket and connected client sockets
         size_t ipcStartIndex = pfds.size();
         ipcServer.appendPollFds(pfds);
 
-        // Poll with 100ms timeout for periodic BluetoothManager tick
-        int pollRc = ::poll(pfds.data(), static_cast<nfds_t>(pfds.size()), 100);
+        // Poll with 100ms timeout for periodic BluetoothManager tick, lowered
+        // to whatever the sd-bus connection asks for while the watcher lives.
+        int pollTimeoutMs = 100;
+        if (bluezWatcher.isActive()) {
+            const int busTimeout = bluezWatcher.getPollTimeoutMs();
+            if (busTimeout >= 0 && busTimeout < pollTimeoutMs) {
+                pollTimeoutMs = busTimeout;
+            }
+        }
+        int pollRc = ::poll(pfds.data(), static_cast<nfds_t>(pfds.size()), pollTimeoutMs);
         if (pollRc < 0) {
             if (errno == EINTR) {
                 continue;
@@ -655,6 +692,12 @@ int main(int argc, char* argv[]) {
             btManager->handleSocketEvent(pfds[btIndex].revents);
         }
 
+        // Check the BlueZ watcher's sd-bus descriptor (also drains its
+        // internal timers on timeout; a bus error degrades to polling).
+        if (busIndex >= 0 && (pfds[busIndex].revents != 0 || bluezWatcher.getPollTimeoutMs() == 0)) {
+            bluezWatcher.process();
+        }
+
         // Check IPC Descriptors
         for (size_t i = ipcStartIndex; i < pfds.size(); ++i) {
             if (pfds[i].revents != 0) {
@@ -662,8 +705,21 @@ int main(int argc, char* argv[]) {
             }
         }
 
-        // Subsystem periodic tick (reconnect backoff)
-        btManager->tick();
+        // Subsystem periodic tick (reconnect backoff). While the BlueZ watcher
+        // is tracking a paired-but-ACL-down headset there is no timer polling
+        // at all: the Connected event drives the reconnect, and the only
+        // scheduled work left is the throttled `bluetoothctl connect` nudge
+        // that wakes a paired but idle headset.
+        if (bluezWatcher.isActive() && btManager->waitingForAclLink()) {
+            // Keep the watcher aimed at the headset even if it was parked
+            // before ever connecting (target MAC is otherwise only learned
+            // in onConnected).
+            bluezWatcher.setTargetMac(btManager->getCurrentDevice().macAddress);
+            // Throttled internally to connectRequestIntervalMs.
+            btManager->requestConnectWakeUp();
+        } else {
+            btManager->tick();
+        }
 
         // Light polling: battery + CNC level (the two values that drift on
         // their own) every kStatusPollInterval.

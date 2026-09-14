@@ -553,6 +553,7 @@ void BluetoothManager::disconnect() {
         transport_->disconnect();
     }
     sendQueue_.clear();
+    waitingForAclLink_ = false;
     setState(ConnectionState::DISCONNECTED);
 }
 
@@ -564,6 +565,7 @@ void BluetoothManager::dropLink(const std::string& reason) {
 }
 
 void BluetoothManager::attemptDiscovery() {
+    waitingForAclLink_ = false;
     setState(ConnectionState::DISCOVERING);
     if (!discovery_) {
         scheduleReconnect("No discovery engine available");
@@ -584,8 +586,9 @@ void BluetoothManager::attemptDiscovery() {
 
     // Never open RFCOMM while BlueZ reports the ACL link down. Hammering
     // connect() on a powered-off headset stresses the kernel Bluetooth stack
-    // (and froze this machine); the link state is known locally via D-Bus, so
-    // poll it cheaply and let BlueZ bring the link up instead.
+    // (and froze this machine); the link state is known via D-Bus, so wait
+    // for the Connected event (timer-based re-poll only as fallback) and let
+    // BlueZ bring the link up instead.
     if (!currentDevice_.connected) {
         auto now = std::chrono::steady_clock::now();
         auto sinceLast = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -762,6 +765,7 @@ bool BluetoothManager::sendPacket(const std::vector<uint8_t>& packet) {
 
 void BluetoothManager::scheduleDiscoveryRetry(const std::string& reason) {
     lastError_ = reason;
+    waitingForAclLink_ = true;
     if (transport_) {
         transport_->disconnect();
     }
@@ -770,13 +774,16 @@ void BluetoothManager::scheduleDiscoveryRetry(const std::string& reason) {
     if (callbacks_.onDisconnected) {
         callbacks_.onDisconnected(reason);
     }
-    // Fixed local-poll cadence; does not grow retryCount_ (no failing I/O here).
+    // Fixed cadence; does not grow retryCount_ (no failing I/O here). The
+    // daemon's poll loop skips this timer entirely while its BlueZ watcher is
+    // active and only re-arms the requestConnect wake-up nudge.
     nextReconnectTime_ = std::chrono::steady_clock::now() +
                          std::chrono::milliseconds(config_.discoveryRetryMs);
 }
 
 void BluetoothManager::scheduleReconnect(const std::string& reason) {
     lastError_ = reason;
+    waitingForAclLink_ = false;
     fprintf(stderr, "[BT] Reconnect scheduled: %s\n", reason.c_str());
     fflush(stderr);
     if (transport_) {
@@ -818,6 +825,48 @@ void BluetoothManager::tick() {
         if (now >= nextReconnectTime_) {
             attemptDiscovery();
         }
+    }
+}
+
+void BluetoothManager::onBluezConnectedChange(bool connected) {
+    if (!config_.autoReconnect || currentDevice_.macAddress.empty()) {
+        return;
+    }
+
+    if (connected) {
+        // The ACL link just came up: run the discovery->SDP->RFCOMM path
+        // immediately instead of waiting out any timer.
+        if (state_ == ConnectionState::RECONNECT_BACKOFF ||
+            state_ == ConnectionState::DISCONNECTED) {
+            fprintf(stderr, "[BT] BlueZ reports headset ACL link up; connecting now\n");
+            fflush(stderr);
+            waitingForAclLink_ = false;
+            attemptDiscovery();
+        }
+        return;
+    }
+
+    // The ACL link dropped: same path as a lost RFCOMM connection.
+    if (state_ == ConnectionState::CONNECTED || state_ == ConnectionState::CONNECTING) {
+        fprintf(stderr, "[BT] BlueZ reports headset ACL link down; dropping RFCOMM\n");
+        fflush(stderr);
+        scheduleReconnect("BlueZ reports ACL link down");
+    } else {
+        // Already parked: re-arm the wake-up nudge timer.
+        waitingForAclLink_ = true;
+    }
+}
+
+void BluetoothManager::requestConnectWakeUp() {
+    if (!waitingForAclLink_ || !discovery_ || currentDevice_.macAddress.empty()) {
+        return;
+    }
+    auto now = std::chrono::steady_clock::now();
+    auto sinceLast = std::chrono::duration_cast<std::chrono::milliseconds>(
+        now - lastConnectRequest_).count();
+    if (sinceLast >= static_cast<int64_t>(config_.connectRequestIntervalMs)) {
+        lastConnectRequest_ = now;
+        discovery_->requestConnect(currentDevice_.macAddress);
     }
 }
 
